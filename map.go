@@ -1,107 +1,78 @@
-package main
+package shapeyourcity
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/danp/shapeyourcity"
-	"github.com/danp/shapeyourcity/internal/store"
-	_ "github.com/mattn/go-sqlite3"
-	"github.com/peterbourgon/ff/v3"
 )
 
-func main() {
-	fs := flag.NewFlagSet("shapeyourcity-sync", flag.ExitOnError)
-	var (
-		databaseFile = fs.String("database-file", "data.db", "data file path")
-		baseURLA     = fs.String("base-url", "", "base URL, eg https://www.shapeyourcityhalifax.ca/peninsula-south-complete-streets/maps/peninsula-south-complete-streets")
-	)
-	ff.Parse(fs, os.Args[1:])
+// A Marker is an entry on a map, usually with associated responses.
+type Marker struct {
+	ID                  int
+	User                string
+	CreatedAt           time.Time
+	Address             string
+	Category            string
+	Latitude, Longitude string
+	URL                 string
+	ResponseURL         string
+	Editable            bool
 
-	if *databaseFile == "" {
-		fatalf("need -database-file")
-	}
-
-	if *baseURLA == "" {
-		fatalf("need -base-url")
-	}
-
-	cl, err := shapeyourcity.NewMapClient(*baseURLA)
-	if err != nil {
-		fatalf("creating map client: %w", err)
-	}
-
-	st, err := store.NewDB(*databaseFile)
-	if err != nil {
-		fatalf("error initializing store: %w", err)
-	}
-
-	err = sync(context.Background(), st, cl)
-
-	st.Close()
-
-	if err != nil {
-		fatalf("error syncing: %s", err)
-	}
+	Responses []MarkerResponse
 }
 
-func sync(ctx context.Context, st *store.DB, cl *shapeyourcity.MapClient) error {
-	storedMarkers, err := st.Markers(ctx)
-	if err != nil {
-		return fmt.Errorf("gathering stored markers: %w", err)
-	}
-
-	storedMarkersByID := make(map[int]shapeyourcity.Marker)
-	for _, m := range storedMarkers {
-		storedMarkersByID[m.ID] = m
-	}
-
-	remoteMarkers, err := cl.Markers(ctx)
-	if err != nil {
-		return fmt.Errorf("fetching remote markers: %w", err)
-	}
-
-	for _, rm := range remoteMarkers {
-		sm, known := storedMarkersByID[rm.ID]
-		if known && !sm.Editable {
-			continue
-		}
-
-		if err := cl.FillResponses(ctx, &rm); err != nil {
-			return fmt.Errorf("filling marker %d responses: %w", rm.ID, err)
-		}
-
-		if err := st.Sync(ctx, rm); err != nil {
-			return fmt.Errorf("syncing marker %d: %w", rm.ID, err)
-		}
-
-		delete(storedMarkersByID, rm.ID)
-	}
-
-	return nil
+// A MarkerResponse captures a response given when creating a marker on a map.
+//
+// Answer will be a JSON object if QuestionType is FileQuestion,
+// otherwise it will be a string. When it is a string, it may have
+// HTML entities escaped.
+type MarkerResponse struct {
+	Mode         string
+	QuestionType string
+	Question     string
+	Answer       []byte
 }
 
-type mapClient struct {
+// A MapClient fetches data from a map.
+type MapClient struct {
 	baseURL *url.URL
 }
 
-func (c *mapClient) markers() ([]shapeyourcity.Marker, error) {
+// NewMapClient returns a new MapClient for the given base URL.
+//
+// The base URL should be the URL visited when viewing the relevant map, eg
+// https://www.shapeyourcityhalifax.ca/mobilityresponse/maps/halifax-mobility-response-streets.
+func NewMapClient(baseURL string) (*MapClient, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parsing base URL: %w", err)
+	}
+
+	if p := u.Path; len(p) < 1 || p[len(p)-1] != '/' {
+		u.Path += "/"
+	}
+
+	return &MapClient{baseURL: u}, nil
+}
+
+// Markers fetches all markers from the client's map.
+//
+// The returned Marker's Responses field will not be filled in.
+// To fill in a Marker's Responses, see FillResponses.
+func (c *MapClient) Markers(ctx context.Context) ([]Marker, error) {
 	markersURL, err := c.baseURL.Parse("markers?filter=other_users")
 	if err != nil {
 		return nil, fmt.Errorf("parsing markers URL: %w", err)
 	}
 
-	b, err := get(markersURL.String())
+	b, err := get(ctx, markersURL.String())
 	if err != nil {
 		return nil, fmt.Errorf("getting markers: %w", err)
 	}
@@ -116,7 +87,7 @@ func (c *mapClient) markers() ([]shapeyourcity.Marker, error) {
 
 	markers := data.Markers
 
-	out := make([]shapeyourcity.Marker, 0, len(markers))
+	out := make([]Marker, 0, len(markers))
 
 	for _, m := range markers {
 		murl, err := c.baseURL.Parse("#marker-" + strconv.Itoa(m.ID))
@@ -129,7 +100,7 @@ func (c *mapClient) markers() ([]shapeyourcity.Marker, error) {
 			return nil, fmt.Errorf("building marker %d response URL: %w", m.ID, err)
 		}
 
-		out = append(out, shapeyourcity.Marker{
+		out = append(out, Marker{
 			ID:          m.ID,
 			User:        m.User.Login,
 			CreatedAt:   m.CreatedAt,
@@ -146,10 +117,12 @@ func (c *mapClient) markers() ([]shapeyourcity.Marker, error) {
 	return out, nil
 }
 
-func (c *mapClient) fillResponses(marker *shapeyourcity.Marker) error {
+// FillResponses fetches responses for the given marker and fills
+// marker.Responses with them.
+func (c *MapClient) FillResponses(ctx context.Context, marker *Marker) error {
 	marker.Responses = nil
 
-	b, err := get(marker.ResponseURL)
+	b, err := get(ctx, marker.ResponseURL)
 	if err != nil {
 		return fmt.Errorf("getting marker %d responses: %w", marker.ID, err)
 	}
@@ -182,7 +155,7 @@ func (c *mapClient) fillResponses(marker *shapeyourcity.Marker) error {
 		}
 		r.Answer = answer
 
-		marker.Responses = append(marker.Responses, shapeyourcity.MarkerResponse{
+		marker.Responses = append(marker.Responses, MarkerResponse{
 			Mode:         r.Mode,
 			QuestionType: r.QuestionType,
 			Question:     r.Question,
@@ -223,26 +196,26 @@ type clientMarkerResponse struct {
 	QuestionType string `json:"question_type"`
 }
 
-func get(u string) ([]byte, error) {
-	resp, err := http.Get(u)
+func get(ctx context.Context, u string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
-		fatalf("requesting %q failed: %s", u, err)
+		return nil, fmt.Errorf("requesting %q failed: %w", u, err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("requesting %q failed: %w", u, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode/100 != 2 {
-		fatalf("requesting %q got bad status %d", u, resp.StatusCode)
+		return nil, fmt.Errorf("requesting %q got bad status %d", u, resp.StatusCode)
 	}
 
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		fatalf("error reading %q body: %s", u, err)
+		return nil, fmt.Errorf("error reading %q body: %w", u, err)
 	}
 
 	return b, nil
-}
-
-func fatalf(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
-	os.Exit(1)
 }

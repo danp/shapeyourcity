@@ -1,7 +1,7 @@
 package main
 
 import (
-	"database/sql"
+	"context"
 	"encoding/csv"
 	"flag"
 	"fmt"
@@ -10,30 +10,14 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/danp/shapeyourcity/internal/store"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/peterbourgon/ff/v3"
 )
-
-type marker struct {
-	id        string
-	url       string
-	createdAt time.Time
-	address   string
-	user      string
-	category  string
-	lat       string
-	lng       string
-
-	responses map[string]string
-}
-
-type responseField struct {
-	name    string
-	matcher *regexp.Regexp
-}
 
 func main() {
 	fs := flag.NewFlagSet("shapeyourcity-dump", flag.ExitOnError)
@@ -62,92 +46,80 @@ func main() {
 		args = args[2:]
 	}
 
-	db, err := sql.Open("sqlite3", *databaseFile)
+	st, err := store.NewDB(*databaseFile)
 	if err != nil {
-		fatalf("error opening data.db: %w", err)
+		fatalf("error initializing store: %w", err)
 	}
-	defer db.Close()
 
-	if err := dump(db, responseFields, os.Stdout); err != nil {
+	err = dump(context.Background(), st, responseFields, os.Stdout)
+
+	st.Close()
+
+	if err != nil {
 		fatalf("error dumping data: %w", err)
 	}
 }
 
-func dump(db *sql.DB, responseFields []responseField, out io.Writer) error {
-	rows, err := db.Query("select id, url, created_at, address, user, category, lat, lng from markers order by created_at")
+type responseField struct {
+	name    string
+	matcher *regexp.Regexp
+}
+
+func (f responseField) match(q string) bool {
+	return f.matcher.MatchString(q)
+}
+
+func dump(ctx context.Context, st *store.DB, responseFields []responseField, out io.Writer) error {
+	markers, err := st.Markers(ctx)
 	if err != nil {
 		return err
 	}
+	sort.Slice(markers, func(i, j int) bool { return markers[i].CreatedAt.Before(markers[j].CreatedAt) })
 
-	markers := make(map[string]marker)
-	for rows.Next() {
-		var m marker
-		if err := rows.Scan(&m.id, &m.url, &m.createdAt, &m.address, &m.user, &m.category, &m.lat, &m.lng); err != nil {
-			return err
-		}
-		m.responses = make(map[string]string)
-		markers[m.id] = m
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-
-	rows, err = db.Query("select marker_id, question, answer from responses")
-	if err != nil {
-		return err
-	}
-
-	for rows.Next() {
-		var id, q, a string
-		if err := rows.Scan(&id, &q, &a); err != nil {
-			return err
-		}
-
-		m := markers[id]
-
-		for _, r := range responseFields {
-			if r.matcher.MatchString(q) {
-				m.responses[r.name] = html.UnescapeString(a)
-				break
+	markerResponseFields := make(map[int]map[string]string)
+	for _, m := range markers {
+		for _, mr := range m.Responses {
+			for _, rf := range responseFields {
+				if rf.match(mr.Question) {
+					if markerResponseFields[m.ID] == nil {
+						markerResponseFields[m.ID] = make(map[string]string)
+					}
+					markerResponseFields[m.ID][rf.name] = html.UnescapeString(string(mr.Answer))
+					break
+				}
 			}
 		}
-
-		markers[id] = m
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-
-	markerIDs := make([]string, 0, len(markers))
-	for id := range markers {
-		markerIDs = append(markerIDs, id)
-	}
-	sort.Slice(markerIDs, func(i, j int) bool { return markers[markerIDs[i]].createdAt.Before(markers[markerIDs[j]].createdAt) })
 
 	w := csv.NewWriter(out)
 
-	responseFieldNames := make([]string, 0, len(responseFields))
+	header := strings.Split("id url created_at address user category lat lng", " ")
 	for _, r := range responseFields {
-		responseFieldNames = append(responseFieldNames, r.name)
+		header = append(header, r.name)
 	}
-	if err := w.Write(append(strings.Split("id url created_at address user category lat lng", " "), responseFieldNames...)); err != nil {
+	if err := w.Write(header); err != nil {
 		return err
 	}
 
-	for _, id := range markerIDs {
-		m := markers[id]
-
+	for _, m := range markers {
 		resps := make([]string, 0, len(responseFields))
 		for _, r := range responseFields {
-			resps = append(resps, m.responses[r.name])
+			resps = append(resps, markerResponseFields[m.ID][r.name])
 		}
-		if err := w.Write(append([]string{m.id, m.url, m.createdAt.Format(time.RFC3339), m.address, m.user, m.category, m.lat, m.lng}, resps...)); err != nil {
+
+		fields := []string{
+			strconv.Itoa(m.ID),
+			m.URL,
+			m.CreatedAt.Format(time.RFC3339),
+			m.Address,
+			m.User,
+			m.Category,
+			m.Latitude,
+			m.Longitude,
+		}
+		fields = append(fields, resps...)
+
+		if err := w.Write(fields); err != nil {
 			return err
 		}
 	}
