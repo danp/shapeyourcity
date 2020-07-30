@@ -16,7 +16,7 @@ func TestMapClientMarkers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp := `
+	const resp = `
 {
   "markers": [
     {
@@ -103,5 +103,69 @@ func TestMapClientMarkers(t *testing.T) {
 	}
 	if d := cmp.Diff(want, got); d != "" {
 		t.Errorf("markers mismatch (-want +got):\n%s", d)
+	}
+}
+
+func TestMapClientFillResponses(t *testing.T) {
+	const resp = `
+{
+  "marker_response": [
+    {
+      "answer": "more bikes, fewer cars",
+      "mode": "comment_mode",
+      "question": "What change would you like to see on the street?",
+      "question_type": "EssayQuestion"
+    },
+    {
+      "answer": {"url":"http://test.local/file.jpg","filename":"IMG_1337.JPG"},
+      "mode": "comment_mode",
+      "question": "How would you like the street to look?",
+      "question_type": "FileQuestion"
+    }
+  ]
+}
+`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && r.URL.Path == "/responses/x.json" {
+			w.Write([]byte(resp))
+			return
+		}
+
+		t.Errorf("unexpected method/path/query: %s %q %s", r.Method, r.URL.Path, r.URL.RawQuery)
+
+		w.WriteHeader(404)
+	}))
+	defer srv.Close()
+
+	cl, err := NewMapClient(srv.URL + "/the-map")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	marker := &Marker{
+		ResponseURL: srv.URL + "/responses/x.json",
+	}
+
+	if err := cl.FillResponses(context.Background(), marker); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []MarkerResponse{
+		{
+			Mode:         "comment_mode",
+			QuestionType: "EssayQuestion",
+			Question:     "What change would you like to see on the street?",
+			Answer:       []byte("more bikes, fewer cars"),
+		},
+		{
+			Mode:         "comment_mode",
+			QuestionType: "FileQuestion",
+			Question:     "How would you like the street to look?",
+			Answer:       []byte(`{"url":"http://test.local/file.jpg","filename":"IMG_1337.JPG"}`),
+		},
+	}
+	if d := cmp.Diff(want, marker.Responses); d != "" {
+		t.Errorf("marker responses mismatch (-want +got):\n%s", d)
 	}
 }
